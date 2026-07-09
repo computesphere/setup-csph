@@ -1,0 +1,63 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        version: [latest, 0.12.1]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install csph
+        id: setup
+        uses: ./
+        with:
+          version: ${{ matrix.version }}
+
+      - name: Assert outputs + PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "resolved: ${{ steps.setup.outputs.csph-version }} (cache-hit: ${{ steps.setup.outputs.cache-hit }})"
+          [ -n "${{ steps.setup.outputs.csph-version }}" ]
+          command -v csph
+          csph --version
+
+      - name: Second install hits the tool cache
+        id: setup2
+        uses: ./
+        with:
+          version: ${{ steps.setup.outputs.csph-version }}
+
+      - name: Assert cache hit
+        shell: bash
+        run: |
+          [ "${{ steps.setup2.outputs.cache-hit }}" = "true" ] || { echo "expected a tool-cache hit"; exit 1; }
+
+  version-file:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Write .csph-version
+        run: echo "0.12.1" > .csph-version
+      - name: Install from version file
+        id: setup
+        uses: ./
+      - name: Assert pinned version was used
+        shell: bash
+        run: |
+          [ "${{ steps.setup.outputs.csph-version }}" = "0.12.1" ] || { echo "expected 0.12.1 from .csph-version, got ${{ steps.setup.outputs.csph-version }}"; exit 1; }
+          csph --version

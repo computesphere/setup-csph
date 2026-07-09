@@ -1,0 +1,150 @@
+name: Setup csph
+description: Install the ComputeSphere CLI (csph) — version-pinned, checksum-verified, cached, and added to PATH.
+author: ComputeSphere
+branding:
+  icon: download-cloud
+  color: blue
+
+inputs:
+  version:
+    description: >-
+      csph version to install (e.g. "0.12.1"). Defaults to "latest". A concrete
+      pin is recommended for reproducible pipelines.
+    required: false
+    default: latest
+  version-file:
+    description: >-
+      Path to a file containing the csph version to install (e.g.
+      ".csph-version"). Used when `version` is "latest" and the file exists, so
+      CI tracks the repository's pinned version.
+    required: false
+    default: .csph-version
+  token:
+    description: >-
+      ComputeSphere API token. When set, it is masked and exported as
+      COMPUTESPHERE_API_TOKEN for subsequent steps, so `csph` commands
+      authenticate without further setup.
+    required: false
+    default: ""
+
+outputs:
+  csph-version:
+    description: The resolved csph version that was installed.
+    value: ${{ steps.install.outputs.csph-version }}
+  cache-hit:
+    description: Whether the binary came from the runner tool cache.
+    value: ${{ steps.install.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install csph
+      id: install
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_VERSION_FILE: ${{ inputs.version-file }}
+      run: |
+        set -euo pipefail
+        REPO="computesphere/csph"
+
+        # ---- resolve version -------------------------------------------------
+        VERSION="$INPUT_VERSION"
+        if [ "$VERSION" = "latest" ] && [ -n "$INPUT_VERSION_FILE" ] && [ -f "$INPUT_VERSION_FILE" ]; then
+          VERSION=$(tr -d ' \t\r\n' < "$INPUT_VERSION_FILE")
+          echo "Using version from $INPUT_VERSION_FILE: $VERSION"
+        fi
+        if [ "$VERSION" = "latest" ]; then
+          # buffer the response before grepping: under pipefail, grep -m1 on a
+          # live pipe SIGPIPEs curl and fails the step
+          RESP=$(curl -fsSL --retry 3 "https://api.github.com/repos/$REPO/releases/latest")
+          VERSION=$(printf '%s' "$RESP" | grep '"tag_name"' | head -n1 \
+            | sed -e 's/.*"tag_name"[[:space:]]*:[[:space:]]*"//' -e 's/".*//')
+          [ -n "$VERSION" ] || { echo "::error::could not resolve the latest csph version"; exit 1; }
+          echo "Resolved latest: $VERSION"
+        fi
+        VERSION="${VERSION#v}"   # tags are bare, tolerate a v-prefix
+
+        # ---- platform → asset ------------------------------------------------
+        case "$RUNNER_OS" in
+          Linux)   OS=linux ;;
+          macOS)   OS=darwin ;;
+          Windows) OS=windows ;;
+          *) echo "::error::unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+        esac
+        case "$RUNNER_ARCH" in
+          X64)   ARCH=amd64 ;;
+          ARM64) ARCH=arm64 ;;
+          X86)   ARCH=386 ;;
+          ARM)   ARCH=arm ;;
+          *) echo "::error::unsupported runner arch: $RUNNER_ARCH"; exit 1 ;;
+        esac
+        if [ "$OS" = "windows" ]; then
+          ASSET="windows_${ARCH}.zip";  SUMS="windows_sha256_checksums.txt";      BIN="csph.exe"
+        else
+          ASSET="${OS}_${ARCH}.tar.gz"; SUMS="linux_macos_sha256S_checksums.txt"; BIN="csph"
+        fi
+
+        # ---- tool cache ------------------------------------------------------
+        TOOL_DIR="${RUNNER_TOOL_CACHE}/csph/${VERSION}/${ARCH}"
+        if [ -x "$TOOL_DIR/$BIN" ] || [ -f "$TOOL_DIR/$BIN" ]; then
+          echo "Tool cache hit: $TOOL_DIR"
+          echo "$TOOL_DIR" >> "$GITHUB_PATH"
+          echo "csph-version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ---- download + verify -----------------------------------------------
+        BASE="https://github.com/$REPO/releases/download/$VERSION"
+        TMP=$(mktemp -d)
+        echo "Downloading $ASSET (csph $VERSION, $OS/$ARCH)…"
+        curl -fsSL --retry 3 -o "$TMP/$ASSET" "$BASE/$ASSET"
+        curl -fsSL --retry 3 -o "$TMP/$SUMS"  "$BASE/$SUMS"
+
+        EXPECTED=$(grep " $ASSET\$" "$TMP/$SUMS" | awk '{print $1}')
+        [ -n "$EXPECTED" ] || { echo "::error::no checksum for $ASSET in $SUMS"; exit 1; }
+        if command -v sha256sum >/dev/null 2>&1; then
+          ACTUAL=$(sha256sum "$TMP/$ASSET" | awk '{print $1}')
+        else
+          ACTUAL=$(shasum -a 256 "$TMP/$ASSET" | awk '{print $1}')
+        fi
+        if [ "$ACTUAL" != "$EXPECTED" ]; then
+          echo "::error::checksum mismatch for $ASSET (expected $EXPECTED, got $ACTUAL)"
+          exit 1
+        fi
+        echo "Checksum verified."
+
+        # ---- extract + install ------------------------------------------------
+        mkdir -p "$TOOL_DIR"
+        case "$ASSET" in
+          *.tar.gz) tar -xzf "$TMP/$ASSET" -C "$TMP" ;;
+          *.zip)    unzip -q -o "$TMP/$ASSET" -d "$TMP" ;;
+        esac
+        # archives wrap the binary in an <os>_<arch>/ directory; historic Windows
+        # archives shipped computesphere.exe — accept either name, install as csph
+        FOUND=$(find "$TMP" -type f \( -name "$BIN" -o -name "computesphere.exe" \) -print -quit)
+        [ -n "$FOUND" ] || { echo "::error::binary not found inside $ASSET"; exit 1; }
+        mv "$FOUND" "$TOOL_DIR/$BIN"
+        chmod +x "$TOOL_DIR/$BIN" 2>/dev/null || true
+        rm -rf "$TMP"
+
+        echo "$TOOL_DIR" >> "$GITHUB_PATH"
+        echo "csph-version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+        echo "Installed csph $VERSION → $TOOL_DIR"
+
+    - name: Configure authentication
+      if: inputs.token != ''
+      shell: bash
+      env:
+        CSPH_TOKEN_INPUT: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::$CSPH_TOKEN_INPUT"
+        echo "COMPUTESPHERE_API_TOKEN=$CSPH_TOKEN_INPUT" >> "$GITHUB_ENV"
+        echo "COMPUTESPHERE_API_TOKEN exported for subsequent steps."
+
+    - name: Verify installation
+      shell: bash
+      run: csph --version
