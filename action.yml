@@ -1,4 +1,4 @@
-name: Setup csph
+name: Setup ComputeSphere CLI
 description: Install the ComputeSphere CLI (csph) — version-pinned, checksum-verified, cached, and added to PATH.
 author: ComputeSphere
 branding:
